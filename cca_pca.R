@@ -67,6 +67,8 @@ ccapca <- function(x, y, a = 0, k, center = TRUE)
 ######
 library(tidyverse)
 library(Seurat)
+library(openxlsx)
+
 S.O.rna <- readRDS('../../Input/DeepToxo/rds/S.O.RNA.phase.pt.rds')
 S.O.atac <- readRDS('../../Input/DeepToxo/rds/S.O_ATAC_labels_pt.rds')
 DefaultAssay(S.O.rna) <- 'RNA'
@@ -77,66 +79,68 @@ cyclic.genes <- read.xlsx('../../Output/DeepToxo/tables/cyclic_genes.xlsx')
 cyclic.genes <- cyclic.genes %>% dplyr::filter(rna.expressed == 1, atac.expressed == 1, rna.cyclic == 1, atac.cyclic == 1)
 
 
-S.O.rna.cyclic    <- subset(S.O.rna, features = gsub('_', '-', cyclic.genes$GeneID))
-S.O.atac.cyclic   <- subset(S.O.atac, features = gsub('_', '-', cyclic.genes$GeneID))
 
-transfer.anchors <- FindTransferAnchors(reference = S.O.rna.cyclic, query = S.O.atac.cyclic, 
-                                        features = VariableFeatures(object = S.O.rna.cyclic),
-                                        reference.assay = "RNA", query.assay = "ACTIVITY", reduction = "cca")
+## This is used as a shortcut to find matching cells in the two dataset
+## reduction can be set to 
+transfer.anchors <- FindTransferAnchors(reference = S.O.rna, query = S.O.atac, 
+                                        features = gsub('_', '-', cyclic.genes$GeneID),
+                                        reference.assay = "RNA", query.assay = "ACTIVITY",
+                                        reduction = 'cca')
+
+match.inds <- data.frame(transfer.anchors@anchors) %>% group_by(cell1) %>% 
+  summarise(cell2 = cell2[which.max(score)], score = score[which.max(score)]) %>% ungroup() %>% group_by(cell2) %>% 
+  summarise(cell1 = cell1[which.max(score)])
+
+rcs <- gsub('_reference', '', transfer.anchors@reference.cells)
+qcs <- gsub('_query', '', transfer.anchors@query.cells)
+
+rcs <- rcs[match.inds$cell1] ## take the anchers out from scRNA
+qcs <- qcs[match.inds$cell2] ## take the anchers out from scATAC
 
 DefaultAssay(S.O.rna) <- 'RNA'
-X <- FetchData(S.O.rna,vars = gsub('_', '-', cyclic.genes$GeneID), slot = 'data')
-x <- t(as.matrix(X))
+X <- FetchData(S.O.rna, vars = gsub('_', '-', cyclic.genes$GeneID), cells = rcs, slot = 'data')
 DefaultAssay(S.O.atac) <- 'ACTIVITY'
-Y <- FetchData(S.O.atac, vars = gsub('_', '-', cyclic.genes$GeneID), slot = 'data')
-y <- t(as.matrix(Y))
-
-library(CCA)
-
-x <- scale(x, scale = FALSE)
-y <- scale(y, scale = FALSE)
-
-##down sample for testing
-comm.rows <- sample(1:nrow(x), 100)
-
-x.ds <- x[comm.rows, sample(1:ncol(x), 200)]
-y.ds <- y[comm.rows, sample(1:ncol(y), 200)]
-cc_results <- cancor(x.ds,y.ds)
-
-cc1_x <- x.ds %*% matrix(cc_results$xcoef[, 1], ncol = 1)
+Y <- FetchData(S.O.atac, vars = gsub('_', '-', cyclic.genes$GeneID), cells = qcs, slot = 'data')
 
 
+L0 <- ccapca(X, Y, a = 0, 3) ## CCA only
+L1 <- ccapca(X, Y, a = 1, 3) ## PCA only
+L5 <- ccapca(X, Y, a = 0.5, 3) ## CCA only
+
+X <- scale(X, scale = F, center = T)
+X.tilde <- as.matrix(X) %*% L1$u
+plot(X.tilde[,1], X.tilde[,2], cex = 0.4, pch = 20)
 
 
+## Project the entire data
+X.all <- FetchData(S.O.rna, vars = gsub('_', '-', cyclic.genes$GeneID), slot = 'data')
+X.all <- scale(X.all, scale = F, center = T)
+X.tilde <- as.matrix(X.all) %*% L5$u
+cols <- S.O.rna@meta.data$phase[match(rownames(X.tilde), S.O.rna@meta.data$Sample)]
+plot(X.tilde[,1], X.tilde[,2], pch=20, cex = 0.4, col = as.factor(cols))
 
-require(ggplot2)
-require(GGally)
-require(CCA)
-require(CCP)
-mm <- read.csv("https://stats.idre.ucla.edu/stat/data/mmreg.csv")
-colnames(mm) <- c("Control", "Concept", "Motivation", "Read", "Write", "Math", 
-                  "Science", "Sex")
-summary(mm)
-
-xtabs(~Sex, data = mm)
-
-
-psych <- mm[, 1:3]
-acad <- mm[, 4:8]
-
-ggpairs(psych)
-matcor(psych, acad)
-
-cc1 <- cc(psych, acad)
-
-# display the canonical correlations
-cc1$cor
+Y.all <- FetchData(S.O.atac, vars = gsub('_', '-', cyclic.genes$GeneID), slot = 'data')
+Y.all <- scale(Y.all, scale = F, center = T)
+Y.tilde <- as.matrix(Y.all) %*% L0$v
+cols <- S.O.atac@meta.data$phase[match(rownames(Y.tilde), S.O.atac@meta.data$Sample)]
+plot(Y.tilde[,1], Y.tilde[,2], pch = 20, cex = 0.4, col = as.factor(cols))
 
 
+## Try with the select cells in a new Seurat Object.
+s.o.atac.sub <- subset(S.O.atac, cells = qcs)
+S.O.tmp <- CreateSeuratObject(counts = s.o.atac.sub@assays$ACTIVITY@counts)
+S.O.tmp <- prep_S.O(S.O.tmp)
+DimPlot(object = S.O.tmp, reduction = 'pca') + NoLegend()
+DimPlot(object = S.O.atac, reduction = 'pca') + NoLegend()
 
-
-
-
-
-
-
+## Try with the select genes in a new Seurat Object.
+s.o.atac.sub <- subset(S.O.atac, features =gsub('_', '-', cyclic.genes$GeneID))
+S.O.tmp <- CreateSeuratObject(counts = s.o.atac.sub@assays$ACTIVITY@counts)
+S.O.tmp <- prep_S.O(S.O.tmp)
+DimPlot(object = S.O.tmp, reduction = 'pca') + NoLegend()
+DimPlot(object = S.O.atac, reduction = 'pca') + NoLegend()
+## Seems like ATAC PCA directions learned from new cells (cca mathched with scRNA) 
+## are significantly different from ATAC PCA using all cells. When using slected cells and
+## projecting all data, we see a circular pattern, even for ALL cells. 
+## That means the cells selected, induce a lower dimention, already influenced by priodicity
+## in RNA. 
